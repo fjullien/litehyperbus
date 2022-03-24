@@ -15,6 +15,8 @@ from litex.soc.interconnect import wishbone
 
 # HyperRAM -----------------------------------------------------------------------------------------
 
+Tcsm = 4e-6 #4µs
+
 class HyperRAM(Module):
     """HyperRAM
 
@@ -24,7 +26,7 @@ class HyperRAM(Module):
 
     This core favors portability and ease of use over performance.
     """
-    def __init__(self, pads, latency=6):
+    def __init__(self, pads, frequency, latency=6):
         self.pads = pads
         self.bus  = bus = wishbone.Interface()
 
@@ -56,17 +58,20 @@ class HyperRAM(Module):
             self.comb += pads.cs_n[1].eq(1)
 
         # Clk.
+        gated_clock = Signal()
         if hasattr(pads, "clk"):
-            self.comb += pads.clk.eq(clk)
+            self.comb += pads.clk.eq(gated_clock)
         else:
-            self.specials += DifferentialOutput(clk, pads.clk_p, pads.clk_n)
+            self.specials += DifferentialOutput(gated_clock, pads.clk_p, pads.clk_n)
 
         # Clock Generation (sys_clk/4) -------------------------------------------------------------
+        clock_stop = Signal()
         self.sync += clk_phase.eq(clk_phase + 1)
         cases = {}
         cases[1] = clk.eq(cs) # Set pads clk on 90° (if cs is set)
         cases[3] = clk.eq(0)  # Clear pads clk on 270°
         self.sync += Case(clk_phase, cases)
+        self.comb += gated_clock.eq(clk & ~clock_stop)
 
         # Data Shift-In Register -------------------------------------------------------------------
         dqi = Signal(dw)
@@ -77,7 +82,7 @@ class HyperRAM(Module):
                 sr_new.eq(Cat(dqi[:8], sr[:-8])) # Only 8-bit during Command/Address.
             )
         ]
-        self.sync += If(clk_phase[0] == 0, sr.eq(sr_new)) # Shift on 0° and 180°
+        self.sync += If((clk_phase[0] == 0) & ~clock_stop, sr.eq(sr_new)) # Shift on 0° and 180°
 
         # Data Shift-Out Register ------------------------------------------------------------------
         self.comb += [
@@ -117,22 +122,36 @@ class HyperRAM(Module):
             bus_adr.eq(bus.adr)
         )
 
+        # Tcsm counter (This limit is called the CS# low maximum time (tCSM )----------------------
+        tcsm         = int(Tcsm * frequency)
+        tcsm_cnt     = Signal(max=tcsm)
+        need_refresh = Signal()
+        self.sync += [
+            If(cs,
+                If(~need_refresh, tcsm_cnt.eq(tcsm_cnt + 1))
+            ).Else(
+                tcsm_cnt.eq(0)
+            ),
+            need_refresh.eq(0),
+            If(tcsm_cnt > tcsm, need_refresh.eq(1))
+        ]
+
         # FSM (Sequencer) --------------------------------------------------------------------------
-        cycles = Signal(8)
-        first  = Signal()
+        cycles    = Signal(8)
+        first     = Signal()
+        next_addr = Signal(32)
         self.submodules.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             NextValue(first, 1),
             If(bus.cyc & bus.stb,
                 If(clk_phase == 0,
                     NextValue(sr, ca),
+                    NextValue(cs, 1),
                     NextState("SEND-COMMAND-ADDRESS")
                 )
             )
         )
         fsm.act("SEND-COMMAND-ADDRESS",
-            # Set CSn.
-            cs.eq(1),
             # Send Command on DQ.
             ca_active.eq(1),
             dq.oe.eq(1),
@@ -142,8 +161,6 @@ class HyperRAM(Module):
             )
         )
         fsm.act("WAIT-LATENCY",
-            # Set CSn.
-            cs.eq(1),
             # Wait for Latency cycles...
             If(cycles == (latency_cycles - 1),
                 # Latch Bus.
@@ -156,8 +173,6 @@ class HyperRAM(Module):
         states = {8:4, 16:2}[dw]
         for n in range(states):
             fsm.act(f"READ-WRITE-DATA{n}",
-                # Set CSn.
-                cs.eq(1),
                 # Send Data on DQ/RWDS (for write).
                 If(bus_we,
                     dq.oe.eq(1),
@@ -172,14 +187,15 @@ class HyperRAM(Module):
                     If(n == (states - 1),
                         NextValue(first, 0),
                         # Continue burst when a consecutive access is ready.
-                        If(bus.stb & bus.cyc & (bus.we == bus_we) & (bus.adr == (bus_adr + 1)),
+                        If(bus.stb & bus.cyc & (bus.we == bus_we) & (bus.adr == (bus_adr + 1) & ~need_refresh),
                             # Latch Bus.
                             bus_latch.eq(1),
                             # Early Write Ack (to allow bursting).
                             bus.ack.eq(bus.we)
                         # Else end the burst.
                         ).Elif(bus_we | ~first,
-                            NextState("IDLE")
+                            NextValue(next_addr, bus_adr + 1),
+                            NextState("WAIT_NEXT_CYCLE")
                         )
                     ),
                     # Read Ack (when dat_r ready).
@@ -188,6 +204,33 @@ class HyperRAM(Module):
                     )
                 )
             )
+        fsm.act("WAIT_NEXT_CYCLE",
+            clock_stop.eq(1),
+            If(bus.cyc & bus.stb,
+                If((next_addr == bus.adr) & (bus_we == bus.we),
+                    bus_latch.eq(1),
+                    bus.ack.eq(bus.we),
+                    NextState("WAIT_CLK_PHASE0"),
+                    If(clk_phase == 0,
+                        NextState("READ-WRITE-DATA0")
+                    )
+                ).Else(
+                    NextValue(cs, 0),
+                    NextState("IDLE")
+                )
+            ),
+            If(need_refresh,
+                NextValue(cs, 0),
+                NextState("IDLE")
+            )
+        )
+        fsm.act("WAIT_CLK_PHASE0",
+            clock_stop.eq(1),
+            If(clk_phase == 0,
+                NextState("READ-WRITE-DATA0")
+            )
+        )
+
         fsm.finalize()
         self.sync += cycles.eq(cycles + 1)
         self.sync += If(fsm.next_state != fsm.state, cycles.eq(0))
